@@ -4,6 +4,9 @@ import json
 import os
 import re
 import torch
+import shutil
+import tempfile
+from pathlib import Path
 
 # from  examples.data_preprocess.gsm8k import instruction_following as gsm8k_prompt
 
@@ -366,6 +369,55 @@ def is_right_gsm8k(prediction:str, ground_truth:str) -> float:
 
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
+TOKENIZER_FILES = {
+    "added_tokens.json",
+    "chat_template.jinja",
+    "config.json",
+    "merges.txt",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer.model",
+    "tokenizer_config.json",
+    "vocab.json",
+}
+
+
+def build_compatible_tokenizer_path(model_path: str) -> str | None:
+    """Return a patched tokenizer directory if the checkpoint tokenizer config is incompatible.
+
+    Some Qwen checkpoints store ``extra_special_tokens`` as a list in
+    ``tokenizer_config.json``. Recent transformers versions expect this field to
+    be a dict and fail with: ``AttributeError: 'list' object has no attribute
+    'keys'``. vLLM lets us pass a separate tokenizer path, so we create a small
+    temporary tokenizer-only directory instead of mutating the original model.
+    """
+    model_dir = Path(model_path)
+    tokenizer_config_path = model_dir / "tokenizer_config.json"
+    if not tokenizer_config_path.is_file():
+        return None
+
+    try:
+        tokenizer_config = json.loads(tokenizer_config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(tokenizer_config.get("extra_special_tokens"), list):
+        return None
+
+    patched_dir = Path(tempfile.mkdtemp(prefix="patched_tokenizer_"))
+    for file_name in TOKENIZER_FILES:
+        src = model_dir / file_name
+        if src.is_file():
+            shutil.copy2(src, patched_dir / file_name)
+
+    tokenizer_config["extra_special_tokens"] = {}
+    (patched_dir / "tokenizer_config.json").write_text(
+        json.dumps(tokenizer_config, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"Patched tokenizer_config.json for transformers compatibility: {patched_dir}")
+    return str(patched_dir)
+
 class DirectBatchInference:
     def __init__(self, model_path: str):
         print("正在加载vLLM模型...")
@@ -399,8 +451,11 @@ class DirectBatchInference:
             print(f"   模式: 张量并行 (tensor_parallel_size={num_gpus})")
         print(f"🛑 停止词: {self.stop_tokens}")
 
+        self.tokenizer_path = build_compatible_tokenizer_path(model_path)
+
         self.model = LLM(
             model=model_path,
+            tokenizer=self.tokenizer_path,
             trust_remote_code=True,
             max_model_len=4096,
             tensor_parallel_size=num_gpus,
